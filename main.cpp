@@ -5,15 +5,231 @@
 #include <Audioclient.h>
 #include <Functiondiscoverykeys_devpkey.h>
 
+#include <zlib.h>
+
 #include <deque>
 #include <vector>
 #include <cstdint>
 #include <utility>
 #include <algorithm>
 
+#include <fstream>
+
+struct display
+{
+	std::wstring device;
+	std::wstring name;
+	int32_t cx;
+	int32_t cy;
+	int32_t width;
+	int32_t height;
+	size_t bits_per_pixel;
+};
+
+class video_encoder
+{
+public:
+	video_encoder()
+		: z()
+	{
+		buf.resize(1024 * 1024);
+		deflateInit(&z, Z_DEFAULT_COMPRESSION);
+	}
+
+	~video_encoder()
+	{
+		deflateEnd(&z);
+	}
+
+	void push_frame(int width, int height, uint8_t * data)
+	{
+		z.next_in = data;
+		z.avail_in = width * height * 4;
+		z.next_out = buf.data();
+		z.avail_out = buf.size();
+
+		size_t compressed_size = 0;
+
+		while (z.avail_in)
+		{
+			if (z.avail_out == 0)
+			{
+				compressed_size += buf.size();
+				z.next_out = buf.data();
+				z.avail_out = buf.size();
+			}
+
+			deflate(&z, Z_NO_FLUSH);
+		}
+
+		for (;;)
+		{
+			if (z.avail_out == 0)
+			{
+				compressed_size += buf.size();
+				z.next_out = buf.data();
+				z.avail_out = buf.size();
+			}
+
+			int r = deflate(&z, Z_FINISH);
+			if (r == Z_STREAM_END)
+				break;
+		}
+
+		compressed_size += buf.size() - z.avail_out;
+
+		deflateReset(&z);
+	}
+
+private:
+	z_stream z;
+	std::vector<uint8_t> buf;
+};
+
+struct window
+{
+	display m_disp;
+	BITMAPINFOHEADER m_bih;
+	HDC m_disp_dc;
+	HDC m_bmp_dc;
+	HBITMAP m_bmp;
+	std::vector<uint8_t> m_dib_buffer;
+
+	video_encoder venc;
+
+	window()
+		: m_bih()
+	{
+		std::vector<display> displays;
+
+		DWORD display_index = 0;
+		for (;; ++display_index)
+		{
+			DISPLAY_DEVICE dd = { sizeof dd };
+			if (!EnumDisplayDevices(0, display_index, &dd, 0))
+				break;
+
+			DEVMODE dm = {};
+			dm.dmSize = sizeof dm;
+			if (EnumDisplaySettingsEx(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm, 0))
+			{
+				display d;
+				d.device = dd.DeviceName;
+				d.name = dd.DeviceString;
+				d.cx = dm.dmPosition.x;
+				d.cy = dm.dmPosition.y;
+				d.width = dm.dmPelsWidth;
+				d.height = dm.dmPelsHeight;
+				d.bits_per_pixel = dm.dmBitsPerPel;
+				displays.push_back(std::move(d));
+			}
+		}
+
+		m_disp = displays[1];
+
+		m_disp_dc = CreateDC(m_disp.device.c_str(), 0, 0, 0);
+		m_bmp_dc = CreateCompatibleDC(0);
+		m_bmp = CreateCompatibleBitmap(m_disp_dc, m_disp.width, m_disp.height);
+		SelectObject(m_bmp_dc, m_bmp);
+
+		m_bih.biSize = sizeof(BITMAPINFOHEADER);
+		m_bih.biWidth = m_disp.width;
+		m_bih.biHeight = m_disp.height;
+		m_bih.biPlanes = 1;
+		m_bih.biBitCount = 32;
+		m_bih.biCompression = BI_RGB;
+
+		m_dib_buffer.resize(m_disp.width * m_disp.height * m_disp.bits_per_pixel / 8);
+	}
+
+	void capture()
+	{
+		BitBlt(m_bmp_dc, 0, 0, m_disp.width, m_disp.height, m_disp_dc, 0, 0, SRCCOPY);
+
+		CURSORINFO ci = { sizeof ci };
+		if (GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING))
+			DrawIconEx(m_bmp_dc, ci.ptScreenPos.x - m_disp.cx, ci.ptScreenPos.y - m_disp.cy, ci.hCursor, 0, 0, 0, 0, DI_NORMAL);
+
+		GetDIBits(m_bmp_dc, m_bmp, 0, m_disp.height, m_dib_buffer.data(), (BITMAPINFO *)&m_bih, 0);
+		venc.push_frame(m_disp.width, m_disp.height, m_dib_buffer.data());
+	}
+
+	void blit_to(HDC dc, int cx, int cy, int width, int height)
+	{
+		StretchBlt(dc, cx, cy, width, height, m_bmp_dc, 0, 0, m_disp.width, m_disp.height, SRCCOPY);
+	}
+};
+
+LRESULT CALLBACK wndproc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+	window * w = (window *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+	if (!w)
+	{
+		w = new window();
+		SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)w);
+	}
+
+	switch (uMsg)
+	{
+	case WM_CREATE:
+		SetTimer(hwnd, 1, 16, 0);
+		return TRUE;
+	case WM_TIMER:
+		if (wParam == 1)
+		{
+			w->capture();
+			InvalidateRect(hwnd, 0, FALSE);
+			return TRUE;
+		}
+		break;
+	case WM_PAINT:
+		{
+			HDC dc = GetDC(hwnd);
+
+			RECT client;
+			GetClientRect(hwnd, &client);
+			w->blit_to(dc, 0, 0, client.right, client.bottom);
+
+			ReleaseDC(hwnd, dc);
+			ValidateRect(hwnd, 0);
+		}
+		return TRUE;
+	case WM_CLOSE:
+		DestroyWindow(hwnd);
+		return TRUE;
+	case WM_DESTROY:
+		PostQuitMessage(0);
+		return TRUE;
+	}
+
+	return DefWindowProc(hwnd, uMsg, wParam, lParam);
+}
+
 int main()
 {
 	CoInitialize(0);
+
+	WNDCLASSEXW wce = {};
+	wce.cbSize = sizeof wce;
+	wce.style = CS_DBLCLKS;
+	wce.hCursor = LoadCursor(0, IDC_ARROW);
+	wce.lpfnWndProc = &wndproc;
+	wce.lpszClassName = L"MainWindow";
+	ATOM cls = RegisterClassExW(&wce);
+
+	HWND hWnd = CreateWindowExW(WS_EX_WINDOWEDGE, MAKEINTATOM(cls), L"MyMeeting", WS_OVERLAPPEDWINDOW,
+		CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, 0, 0, 0, 0);
+
+	ShowWindow(hWnd, SW_SHOWDEFAULT);
+
+	MSG msg;
+	while (GetMessageW(&msg, 0, 0, 0))
+	{
+		TranslateMessage(&msg);
+		DispatchMessageW(&msg);
+	}
+
+	return msg.wParam;
 
 	const CLSID CLSID_MMDeviceEnumerator = __uuidof(MMDeviceEnumerator);
 	const IID IID_IMMDeviceEnumerator = __uuidof(IMMDeviceEnumerator);
