@@ -44,9 +44,19 @@ public:
 	void push_frame(int width, int height, uint8_t * data)
 	{
 		z.next_in = data;
-		z.avail_in = width * height * 4;
+		z.avail_in = width * height * 3;
 		z.next_out = buf.data();
 		z.avail_out = buf.size();
+
+		std::vector<uint8_t> new_data(data, data + z.avail_in);
+
+		if (m_prev_frame.size())
+		{
+			for (size_t i = 0; i < m_prev_frame.size(); ++i)
+				data[i] -= m_prev_frame[i];
+		}
+
+		new_data.swap(m_prev_frame);
 
 		size_t compressed_size = 0;
 
@@ -71,19 +81,19 @@ public:
 				z.avail_out = buf.size();
 			}
 
-			int r = deflate(&z, Z_FINISH);
-			if (r == Z_STREAM_END)
+			int r = deflate(&z, Z_SYNC_FLUSH);
+			if (z.avail_out != 0)
 				break;
 		}
 
 		compressed_size += buf.size() - z.avail_out;
-
-		deflateReset(&z);
+		std::cout << compressed_size << "    \r" << std::flush;
 	}
 
 private:
 	z_stream z;
 	std::vector<uint8_t> buf;
+	std::vector<uint8_t> m_prev_frame;
 };
 
 struct window
@@ -136,7 +146,7 @@ struct window
 		m_bih.biWidth = m_disp.width;
 		m_bih.biHeight = m_disp.height;
 		m_bih.biPlanes = 1;
-		m_bih.biBitCount = 32;
+		m_bih.biBitCount = 24;
 		m_bih.biCompression = BI_RGB;
 
 		m_dib_buffer.resize(m_disp.width * m_disp.height * m_disp.bits_per_pixel / 8);
